@@ -1,0 +1,38 @@
+{
+  "local_teste": {
+    "device_id": "local_teste",
+    "nivel_pct": 80,
+    "wifi_rssi": -40,
+    "received_at": 1763751417328
+  },
+  "teste_https": {
+    "device_id": "teste_https",
+    "wifi_rssi": -40,
+    "nivel_pct": 80,
+    "received_at": 1764122803031
+  },
+  "teste_postman": {
+    "device_id": "teste_postman",
+    "nivel_pct": 55,
+    "wifi_rssi": -6,
+    "received_at": 1764424219711
+  },
+  "predio/torreA/sub1/reservatorio1": {
+    "device_id": "predio/torreA/sub1/reservatorio1",
+    "wifi_rssi": -52,
+    "ts": 4301478,
+    "nivel_pct": 62.10195,
+    "nivel_mm": 745.2234,
+    "sim_nivel": 4.713065,
+    "gas": 0.563614,
+    "temp_c": 25.1,
+    "umid_pct": 66,
+    "ds18_c": -127,
+    "tds_ppm": 53.99267,
+    "peso": null,
+    "relay1": false,
+    "relay2": false,
+    "relay3": false,
+    "received_at": 1764448075980
+  }
+}

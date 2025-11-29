@@ -50,3 +50,11 @@ export interface Company {
   name: string;
 }
    
+export enum WidgetType {
+  Tank = 'Tank',
+  Switch = 'Switch',
+  Gauge = 'Gauge',
+  Value = 'Value',
+  Trend = 'Trend',
+  Status = 'Status',
+}

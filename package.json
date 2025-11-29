@@ -1,18 +1,19 @@
 {
+  "homepage": "https://devices.net.br/",
+
   "name": "devices-cloud",
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "scripts": {
-    "dev": "concurrently \"node server.cjs\" \"vite\"",
-    "build": "vite build",
-    "preview": "node server.cjs"
-  },
   "dependencies": {
+    "aedes": "^0.51.3",
+    "chokidar": "^4.0.3",
     "express": "^4.21.1",
+    "ftp-srv": "^4.6.3",
     "http-proxy-middleware": "^3.0.3",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
@@ -25,10 +26,11 @@
     "vite": "^6.2.0"
   },
   "scripts": {
+    "dev": "concurrently \"node server/server.cjs\" \"vite\"",
+    "dev:proxy": "node server/server.cjs",
     "build": "vite build",
+    "preview": "vite preview --port 3000 --host",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist"
   }
-
-
 }
