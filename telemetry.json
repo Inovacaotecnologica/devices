@@ -20,19 +20,19 @@
   "predio/torreA/sub1/reservatorio1": {
     "device_id": "predio/torreA/sub1/reservatorio1",
     "wifi_rssi": -52,
-    "ts": 4301478,
-    "nivel_pct": 62.10195,
-    "nivel_mm": 745.2234,
-    "sim_nivel": 4.713065,
-    "gas": 0.563614,
+    "ts": 6712357,
+    "nivel_pct": 74.70218,
+    "nivel_mm": 896.4261,
+    "sim_nivel": 5.299145,
+    "gas": 0.488645,
     "temp_c": 25.1,
     "umid_pct": 66,
     "ds18_c": -127,
-    "tds_ppm": 53.99267,
+    "tds_ppm": 50.3663,
     "peso": null,
     "relay1": false,
     "relay2": false,
     "relay3": false,
-    "received_at": 1764448075980
+    "received_at": 1764450483918
   }
 }
