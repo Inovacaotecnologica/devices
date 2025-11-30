@@ -6,7 +6,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
 
   return {
-    base: '/devices/', // Caminho base no GitHub Pages
+    base: '/', // Caminho base no GitHub Pages
 
     server: {
       port: 3000,
