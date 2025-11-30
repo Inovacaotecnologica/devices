@@ -22,12 +22,14 @@ import {
 } from './icons';
 
 // =================================================================================
-// TIPAGEM LOCAL ESTENDIDA (THRESHOLDS POR WIDGET)
+// TIPAGEM LOCAL ESTENDIDA (THRESHOLDS POR WIDGET + FÓRMULA ENGENHARIA)
 // =================================================================================
 
 type ExtendedWidget = Widget & {
   minAcceptable?: number | null;
   maxAcceptable?: number | null;
+  /** Fórmula de engenharia, exemplo: x * 0.25 + 10 */
+  engFormula?: string | null;
 };
 
 interface I18nContextType {
@@ -67,6 +69,48 @@ const AlertsContext = createContext<AlertsContextType | null>(null);
 const useAlerts = () => useContext(AlertsContext)!;
 
 // =================================================================================
+// FUNÇÕES AUXILIARES – TIMESTAMP DO DISPOSITIVO
+// =================================================================================
+
+/**
+ * Tenta extrair do JSON recebido o timestamp real do dispositivo.
+ * Aceita campos: device_timestamp, timestamp, time, ts, lastUpdate, last_update, update.
+ * Pode ser número (ms ou segundos) ou string ISO.
+ */
+const extractDeviceTimestamp = (payload: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null;
+
+  const candidates = [
+    'device_timestamp',
+    'timestamp',
+    'time',
+    'ts',
+    'lastUpdate',
+    'last_update',
+    'update', // campo usado pelo ESP32 para indicar última atualização
+  ];
+
+  for (const key of candidates) {
+    const value = (payload as any)[key];
+    if (value === undefined || value === null || value === '') continue;
+
+    // Número: pode ser em milissegundos ou segundos (epoch)
+    if (typeof value === 'number') {
+      const ms = value > 1e12 ? value : value * 1000;
+      if (!Number.isNaN(ms) && Number.isFinite(ms)) return ms;
+    }
+
+    // String ISO ou similar
+    if (typeof value === 'string') {
+      const parsed = Date.parse(value);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+  }
+
+  return null;
+};
+
+// =================================================================================
 // PROVIDERS
 // =================================================================================
 
@@ -83,7 +127,6 @@ const I18nProvider = ({ children }: { children: ReactNode }) => {
 const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
 
-  // Carrega usuário do localStorage ao montar
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
@@ -125,7 +168,6 @@ const AuthProvider = ({ children }: { children: ReactNode }) => {
   const logout = () => {
     setUser(null);
     if (typeof window !== 'undefined') {
-      // Mantém companies/devices para o usuário, apaga apenas o user atual
       localStorage.removeItem('user');
     }
   };
@@ -144,7 +186,6 @@ const AlertsProvider = ({ children }: { children: ReactNode }) => {
         maxAcceptable: widget.maxAcceptable ?? null,
       });
 
-      // Integração opcional com o dispositivo (ex.: endpoint de alerta HTTP)
       try {
         const cfg = (device as any).protocolConfig || {};
         if (device.protocol === Protocol.HTTP && cfg.alertUrl) {
@@ -178,7 +219,7 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
   const [companies, setCompanies] = useState<Company[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
 
-  // Carrega empresas e dispositivos do localStorage quando o usuário é definido
+  // Carrega empresas e dispositivos do localStorage por usuário
   useEffect(() => {
     if (!user || typeof window === 'undefined') return;
     const companiesKey = `companies_${user.email}`;
@@ -195,22 +236,26 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
     }
   }, [user]);
 
-  // Salva empresas por usuário
+  // Persiste empresas
   useEffect(() => {
     if (!user || typeof window === 'undefined') return;
     const companiesKey = `companies_${user.email}`;
     localStorage.setItem(companiesKey, JSON.stringify(companies));
   }, [companies, user]);
 
-  // Salva dispositivos por usuário
+  // Persiste dispositivos
   useEffect(() => {
     if (!user || typeof window === 'undefined') return;
     const devicesKey = `devices_${user.email}`;
     localStorage.setItem(devicesKey, JSON.stringify(devices));
   }, [devices, user]);
 
-  // Polling de dados
+  // ===========================================================
+  // POLLING: MONITORAMENTO ONLINE/OFFLINE BASEADO EM UPDATE
+  // ===========================================================
   useEffect(() => {
+    if (!user) return;
+
     const dataInterval = setInterval(() => {
       setDevices((currentDevices) => {
         const fetchAndUpdateAll = async () => {
@@ -227,17 +272,52 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
                 }
 
                 const newData = await response.json();
+
                 if (
                   typeof newData === 'object' &&
                   newData !== null &&
                   !Array.isArray(newData)
                 ) {
                   const now = Date.now();
-                  const rssiOk =
-                    typeof newData.wifi_rssi === 'number' && newData.wifi_rssi < 0;
-                  const isOnline = true || rssiOk;
-                  return { ...d, lastData: newData, lastUpdated: now, isOnline };
+
+                  // 1) Tenta usar timestamp do próprio payload (device_timestamp, timestamp, time, ts, lastUpdate, last_update, update)
+                  const deviceTs = extractDeviceTimestamp(newData);
+
+                  let lastUpdated = d.lastUpdated || 0;
+
+                  if (deviceTs !== null) {
+                    // se o dispositivo manda timestamp de verdade
+                    lastUpdated = deviceTs;
+                  } else {
+                    // 2) Se não tiver timestamp, usa campo "update" como sequência de atualização
+                    const prevUpdate = (d.lastData as any)?.update;
+                    const newUpdate = (newData as any)?.update;
+
+                    if (newUpdate !== undefined && newUpdate !== null) {
+                      if (prevUpdate === undefined || prevUpdate === null) {
+                        // nenhum histórico, considera esta a primeira atualização
+                        lastUpdated = now;
+                      } else if (newUpdate !== prevUpdate) {
+                        // update mudou, então houve nova leitura real do ESP32
+                        lastUpdated = now;
+                      }
+                      // se update não mudou, mantém lastUpdated antigo
+                    } else {
+                      // 3) Sem timestamp e sem update: usa agora como fallback genérico
+                      lastUpdated = now;
+                    }
+                  }
+
+                  const isOnline = now - lastUpdated <= OFFLINE_THRESHOLD;
+
+                  return {
+                    ...d,
+                    lastData: newData,
+                    lastUpdated,
+                    isOnline,
+                  };
                 }
+
                 console.error(
                   `[Device: ${d.name}] Invalid JSON object received:`,
                   newData,
@@ -263,10 +343,14 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
       });
     }, 3000);
 
+    // Verificação extra de offline baseada em lastUpdated
     const offlineCheckInterval = setInterval(() => {
+      const now = Date.now();
       setDevices((prevDevices) =>
         prevDevices.map((d) => {
-          if (d.isOnline && Date.now() - d.lastUpdated > OFFLINE_THRESHOLD) {
+          if (!d.lastUpdated) return d;
+          const diff = now - d.lastUpdated;
+          if (diff > OFFLINE_THRESHOLD && d.isOnline) {
             return { ...d, isOnline: false };
           }
           return d;
@@ -278,7 +362,7 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
       clearInterval(dataInterval);
       clearInterval(offlineCheckInterval);
     };
-  }, []);
+  }, [user]);
 
   const addCompany = useCallback((name: string) => {
     const newCompany: Company = { id: `comp_${Date.now()}`, name };
@@ -326,8 +410,24 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
 };
 
 // =================================================================================
-// HOOK DE THRESHOLD + ALERTA
+// HOOK DE THRESHOLD + ALERTA + FÓRMULA DE ENGENHARIA
 // =================================================================================
+
+const applyEngineeringFormula = (widget: ExtendedWidget, numeric: number): number => {
+  if (!widget.engFormula || !widget.engFormula.trim()) return numeric;
+
+  try {
+    const fn = new Function('x', `return ${widget.engFormula}`) as (x: number) => number;
+    const result = fn(numeric);
+    if (typeof result === 'number' && !Number.isNaN(result) && Number.isFinite(result)) {
+      return result;
+    }
+    return numeric;
+  } catch (err) {
+    console.error(`Erro na fórmula de engenharia do widget "${widget.name}"`, err);
+    return numeric;
+  }
+};
 
 const useThresholdAlert = (
   device: Device,
@@ -337,21 +437,28 @@ const useThresholdAlert = (
   const { triggerAlert } = useAlerts();
   const [hasAlerted, setHasAlerted] = useState(false);
 
-  const numericValue =
+  const baseNumeric =
     typeof rawValue === 'number'
       ? rawValue
       : rawValue !== undefined && rawValue !== null && rawValue !== ''
       ? Number(rawValue)
       : NaN;
 
-  const hasNumeric = !Number.isNaN(numericValue);
+  const hasBaseNumeric = !Number.isNaN(baseNumeric);
+
+  const engineeredValue = hasBaseNumeric
+    ? applyEngineeringFormula(widget, baseNumeric)
+    : NaN;
+
+  const hasNumeric = !Number.isNaN(engineeredValue);
+
   const min = widget.minAcceptable ?? null;
   const max = widget.maxAcceptable ?? null;
 
   const isOutOfRange =
     hasNumeric &&
-    ((min !== null && numericValue < min) ||
-      (max !== null && numericValue > max));
+    ((min !== null && engineeredValue < min) ||
+      (max !== null && engineeredValue > max));
 
   useEffect(() => {
     if (isOutOfRange && !hasAlerted) {
@@ -365,7 +472,7 @@ const useThresholdAlert = (
 
   return {
     isOutOfRange,
-    numericValue: hasNumeric ? numericValue : null,
+    numericValue: hasNumeric ? engineeredValue : null,
   };
 };
 
@@ -467,8 +574,14 @@ const GaugeWidget: React.FC<WidgetProps> = ({ device, widget }) => {
 
 const ValueWidget: React.FC<WidgetProps> = ({ device, widget }) => {
   const rawValue = (device.lastData as any)[widget.dataKey];
-  const { isOutOfRange } = useThresholdAlert(device, widget, rawValue);
-  const value = rawValue !== undefined && rawValue !== null ? String(rawValue) : 'N/A';
+  const { isOutOfRange, numericValue } = useThresholdAlert(device, widget, rawValue);
+
+  const value =
+    numericValue !== null
+      ? String(numericValue)
+      : rawValue !== undefined && rawValue !== null
+      ? String(rawValue)
+      : 'N/A';
 
   return (
     <div className="flex flex-col items-center justify-center h-full p-4">
@@ -488,8 +601,6 @@ const ValueWidget: React.FC<WidgetProps> = ({ device, widget }) => {
     </div>
   );
 };
-
-// ===================== NOVOS WIDGETS PROFISSIONAIS ======================
 
 const MAX_TREND_POINTS = 20;
 
@@ -514,14 +625,12 @@ const TrendWidget: React.FC<WidgetProps> = ({ device, widget }) => {
   const normalized = points.map((v) => (v - min) / range);
 
   return (
-    <div className="flex flex-col h-full p-3">
+    <div className="flex flex-col h-40 p-3">
       <div className="flex justify-between text-[10px] text-slate-400 mb-1">
         <span>Últimos {points.length} valores</span>
         {numericValue != null && (
           <span
-            className={
-              isOutOfRange ? 'text-red-400 font-semibold' : 'text-cyan-400'
-            }
+            className={isOutOfRange ? 'text-red-400 font-semibold' : 'text-cyan-400'}
           >
             {numericValue.toFixed(2)} {widget.unit}
           </span>
@@ -585,7 +694,116 @@ const StatusWidget: React.FC<WidgetProps> = ({ device, widget }) => {
   );
 };
 
-// ATENÇÃO: para usar Trend e Status, inclua esses valores no enum WidgetType em ./types
+const TemperatureGaugeWidget: React.FC<WidgetProps> = ({ device, widget }) => {
+  const rawValue = (device.lastData as any)[widget.dataKey] ?? 0;
+  const { numericValue, isOutOfRange } = useThresholdAlert(device, widget, rawValue);
+  const value = numericValue ?? 0;
+
+  const pct = Math.max(0, Math.min(100, (value / 60) * 100));
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-3">
+      <div className="relative flex flex-col items-center">
+        <div className="w-6 h-24 bg-slate-900 rounded-full border border-slate-600 flex flex-col justify-end overflow-hidden">
+          <div
+            className={`w-full transition-all duration-300 ${
+              isOutOfRange ? 'bg-red-500' : 'bg-orange-400'
+            }`}
+            style={{ height: `${pct}%` }}
+          />
+        </div>
+        <div className="w-8 h-8 bg-slate-900 rounded-full border border-slate-600 -mt-3 flex items-center justify-center">
+          <div
+            className={`w-5 h-5 rounded-full ${
+              isOutOfRange ? 'bg-red-500' : 'bg-orange-400'
+            }`}
+          />
+        </div>
+      </div>
+      <div className="mt-2 text-xl font-bold text-white">
+        {value.toFixed(1)}°C
+      </div>
+    </div>
+  );
+};
+
+const HumidityGaugeWidget: React.FC<WidgetProps> = ({ device, widget }) => {
+  const rawValue = (device.lastData as any)[widget.dataKey] ?? 0;
+  const { numericValue, isOutOfRange } = useThresholdAlert(device, widget, rawValue);
+  const value = numericValue ?? 0;
+  const pct = Math.max(0, Math.min(100, value));
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-3">
+      <div className="w-full h-3 bg-slate-800 rounded-full overflow-hidden">
+        <div
+          className={`h-full rounded-full ${
+            isOutOfRange ? 'bg-red-500' : 'bg-sky-400'
+          }`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="mt-2 text-2xl font-bold text-sky-400">
+        {value.toFixed(0)}%
+      </div>
+      <div className="text-xs text-slate-400">Umidade</div>
+    </div>
+  );
+};
+
+const GasGaugeWidget: React.FC<WidgetProps> = ({ device, widget }) => {
+  const rawValue = (device.lastData as any)[widget.dataKey] ?? 0;
+  const { numericValue, isOutOfRange } = useThresholdAlert(device, widget, rawValue);
+  const value = numericValue ?? 0;
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-3">
+      <div
+        className={`text-3xl font-bold ${
+          isOutOfRange ? 'text-red-400' : 'text-yellow-300'
+        }`}
+      >
+        {value.toFixed(0)} ppm
+      </div>
+      <div className="text-xs text-slate-400">Nível de gás</div>
+    </div>
+  );
+};
+
+const WaterQualityGaugeWidget: React.FC<WidgetProps> = ({ device, widget }) => {
+  const rawValue = (device.lastData as any)[widget.dataKey] ?? 0;
+  const { numericValue, isOutOfRange } = useThresholdAlert(device, widget, rawValue);
+  const value = numericValue ?? 0;
+
+  let quality = 'Inadequada';
+  let color = 'text-red-400';
+
+  if (value < 300) {
+    quality = 'Excelente';
+    color = 'text-emerald-400';
+  } else if (value < 600) {
+    quality = 'Boa';
+    color = 'text-green-400';
+  } else if (value < 900) {
+    quality = 'Ruim';
+    color = 'text-yellow-300';
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full p-3">
+      <div className={`text-3xl font-bold ${color}`}>
+        {value.toFixed(0)} ppm
+      </div>
+      <div className="text-xs text-slate-400">{quality}</div>
+      {isOutOfRange && (
+        <div className="mt-1 text-[10px] text-red-400 font-semibold">
+          Fora da faixa alvo
+        </div>
+      )}
+    </div>
+  );
+};
+
 const widgetComponentMap: Record<WidgetType, React.FC<WidgetProps>> = {
   [WidgetType.Tank]: TankWidget,
   [WidgetType.Switch]: SwitchWidget,
@@ -593,6 +811,157 @@ const widgetComponentMap: Record<WidgetType, React.FC<WidgetProps>> = {
   [WidgetType.Value]: ValueWidget,
   [WidgetType.Trend]: TrendWidget,
   [WidgetType.Status]: StatusWidget,
+  [WidgetType.TemperatureGauge]: TemperatureGaugeWidget,
+  [WidgetType.HumidityGauge]: HumidityGaugeWidget,
+  [WidgetType.GasGauge]: GasGaugeWidget,
+  [WidgetType.WaterQualityGauge]: WaterQualityGaugeWidget,
+};
+
+// =================================================================================
+// MODAL DETALHADO DO DISPOSITIVO (PAINEL / GRÁFICOS)
+// =================================================================================
+
+interface DeviceDetailModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  device: Device;
+}
+
+const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
+  isOpen,
+  onClose,
+  device,
+}) => {
+  const { t } = useI18n();
+  const widgets = ((device as any).widgets || []) as ExtendedWidget[];
+  const [viewMode, setViewMode] = useState<'widgets' | 'charts'>('widgets');
+
+  if (!isOpen) return null;
+
+  const imageUrl = (device as any).imageUrl as string | undefined;
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      title={`${device.name} – ${t('dashboard.devices')}`}
+    >
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          <h3 className="text-lg font-bold text-white">{device.name}</h3>
+          <p className="text-xs text-slate-400">{device.protocol}</p>
+          {device.isOnline && (
+            <p className="text-xs text-slate-500">
+              {t('device.lastUpdate')}:{' '}
+              {new Date(device.lastUpdated).toLocaleTimeString(undefined, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+              })}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {device.isOnline ? (
+            <span className="flex items-center gap-1 text-green-400 text-xs">
+              <WifiIcon className="w-4 h-4" />
+              Online
+            </span>
+          ) : (
+            <span className="flex items-center gap-1 text-red-400 text-xs">
+              <NoWifiIcon className="w-4 h-4" />
+              {t('device.offline')}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {imageUrl && (
+        <div className="w-full flex justify-center mb-4">
+          <img
+            src={imageUrl}
+            alt={device.name}
+            className="max-h-40 object-contain rounded-md border border-slate-700 bg-slate-900 p-2"
+          />
+        </div>
+      )}
+
+      <div className="flex justify-center mb-4 gap-2">
+        <button
+          className={`px-3 py-1 text-xs rounded-full border ${
+            viewMode === 'widgets'
+              ? 'bg-sky-600 border-sky-500 text-white'
+              : 'bg-slate-700 border-slate-600 text-slate-200'
+          }`}
+          onClick={() => setViewMode('widgets')}
+        >
+          Painel
+        </button>
+        <button
+          className={`px-3 py-1 text-xs rounded-full border ${
+            viewMode === 'charts'
+              ? 'bg-sky-600 border-sky-500 text-white'
+              : 'bg-slate-700 border-slate-600 text-slate-200'
+          }`}
+          onClick={() => setViewMode('charts')}
+        >
+          Gráficos
+        </button>
+      </div>
+
+      {viewMode === 'widgets' && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {widgets.map((widget) => {
+            const WidgetComponent = widgetComponentMap[widget.type];
+            return (
+              <div
+                key={widget.id}
+                className="bg-slate-900 rounded-md p-3 flex flex-col"
+              >
+                <h4 className="text-xs text-center text-slate-400 font-semibold mb-1 truncate">
+                  {widget.name}
+                </h4>
+                <div className="flex-grow">
+                  {WidgetComponent && (
+                    <WidgetComponent
+                      device={device}
+                      widget={widget as ExtendedWidget}
+                    />
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {widgets.length === 0 && (
+            <p className="text-xs text-slate-500 text-center col-span-full">
+              {t('dashboard.noDevices')}
+            </p>
+          )}
+        </div>
+      )}
+
+      {viewMode === 'charts' && (
+        <div className="space-y-3">
+          {widgets.map((widget) => (
+            <div
+              key={widget.id}
+              className="bg-slate-900 rounded-md p-3 flex flex-col"
+            >
+              <h4 className="text-xs text-slate-400 font-semibold mb-2">
+                {widget.name} – {widget.dataKey}
+              </h4>
+              <TrendWidget device={device} widget={widget as ExtendedWidget} />
+            </div>
+          ))}
+          {widgets.length === 0 && (
+            <p className="text-xs text-slate-500 text-center">
+              Nenhum widget configurado para gráficos.
+            </p>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
 };
 
 // =================================================================================
@@ -603,6 +972,7 @@ const DeviceCard: React.FC<{ device: Device }> = ({ device }) => {
   const { t } = useI18n();
   const { deleteDevice } = useData();
   const [isJsonModalOpen, setJsonModalOpen] = useState(false);
+  const [isDetailOpen, setDetailOpen] = useState(false);
 
   const hasAnyAlert = useMemo(() => {
     const widgets = (device as any).widgets as ExtendedWidget[] | undefined;
@@ -610,28 +980,37 @@ const DeviceCard: React.FC<{ device: Device }> = ({ device }) => {
 
     return widgets.some((w) => {
       const rawValue = (device.lastData as any)[w.dataKey];
-      const numeric =
+      const baseNumeric =
         typeof rawValue === 'number'
           ? rawValue
           : rawValue != null
           ? Number(rawValue)
           : NaN;
-      const hasNumeric = !Number.isNaN(numeric);
+      if (Number.isNaN(baseNumeric)) return false;
+
+      const engineered = applyEngineeringFormula(w, baseNumeric);
       const min = w.minAcceptable ?? null;
       const max = w.maxAcceptable ?? null;
+
       return (
-        hasNumeric &&
-        ((min !== null && numeric < min) || (max !== null && numeric > max))
+        ((min !== null && engineered < min) || (max !== null && engineered > max))
       );
     });
   }, [device]);
 
   const widgets = ((device as any).widgets || []) as ExtendedWidget[];
+  const imageUrl = (device as any).imageUrl as string | undefined;
+
+  const handleCardClick = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('button') || target.closest('svg')) return;
+    setDetailOpen(true);
+  };
 
   return (
     <>
       <div
-        className={`bg-slate-800 rounded-lg shadow-lg relative col-span-1 row-span-1 flex flex-col transition-opacity duração-500 ${
+        className={`bg-slate-800 rounded-lg shadow-lg relative col-span-1 row-span-1 flex flex-col transition-opacity	duration-500 ${
           !device.isOnline ? 'opacity-50' : ''
         }`}
       >
@@ -643,7 +1022,7 @@ const DeviceCard: React.FC<{ device: Device }> = ({ device }) => {
             <p className="text-[10px] sm:text-xs text-slate-400">
               {device.protocol}
             </p>
-            {device.isOnline && (
+            {device.lastUpdated > 0 && (
               <p className="text-[10px] sm:text-xs text-slate-500">
                 {t('device.lastUpdate')}:{' '}
                 {new Date(device.lastUpdated).toLocaleTimeString(undefined, {
@@ -686,40 +1065,63 @@ const DeviceCard: React.FC<{ device: Device }> = ({ device }) => {
             </button>
           </div>
         </div>
-        {widgets.length === 0 ? (
-          <div className="flex-grow flex items-center justify-center text-slate-500 text-xs sm:text-sm">
-            No widgets configured.
-          </div>
-        ) : (
-          <div className="p-2 flex-grow grid grid-cols-1 sm:grid-cols-2 gap-2">
-            {widgets.map((widget) => {
-              const WidgetComponent = widgetComponentMap[widget.type];
-              return (
-                <div
-                  key={widget.id}
-                  className="bg-slate-900 rounded-md p-2 flex flex-col"
-                >
-                  <h4 className="text-[11px] text-center text-slate-400 font-semibold mb-1 truncate">
-                    {widget.name}
-                  </h4>
-                  <div className="flex-grow">
-                    {WidgetComponent && (
-                      <WidgetComponent
-                        device={device}
-                        widget={widget as ExtendedWidget}
-                      />
-                    )}
+
+        <div
+          className="flex-1 flex flex-col cursor-pointer min-h-[260px]"
+          onClick={handleCardClick}
+        >
+          {imageUrl && (
+            <div className="w-full border-b border-slate-700 bg-slate-900 flex justify-center">
+              <img
+                src={imageUrl}
+                alt={device.name}
+                className="max-h-24 object-contain p-2"
+              />
+            </div>
+          )}
+
+          {widgets.length === 0 ? (
+            <div className="flex-grow flex items-center justify-center text-slate-500 text-xs sm:text-sm">
+              No widgets configured.
+            </div>
+          ) : (
+            <div className="p-2 flex-grow grid grid-cols-1 gap-2">
+              {widgets.slice(0, 2).map((widget) => {
+                const WidgetComponent = widgetComponentMap[widget.type];
+                return (
+                  <div
+                    key={widget.id}
+                    className="bg-slate-900 rounded-md p-2 flex flex-col"
+                  >
+                    <h4 className="text-[11px] text-center text-slate-400 font-semibold mb-1 truncate">
+                      {widget.name}
+                    </h4>
+                    <div className="flex-grow">
+                      {WidgetComponent && (
+                        <WidgetComponent
+                          device={device}
+                          widget={widget as ExtendedWidget}
+                        />
+                      )}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
+                );
+              })}
+            </div>
+          )}
+        </div>
       </div>
+
       <JsonViewerModal
         isOpen={isJsonModalOpen}
         onClose={() => setJsonModalOpen(false)}
         data={device.lastData}
+      />
+
+      <DeviceDetailModal
+        isOpen={isDetailOpen}
+        onClose={() => setDetailOpen(false)}
+        device={device}
       />
     </>
   );
@@ -745,11 +1147,11 @@ const Modal: React.FC<ModalProps> = ({ isOpen, onClose, children, title }) => {
       onClick={onClose}
     >
       <div
-        className="bg-slate-800 rounded-lg shadow-2xl w-full max-w-md max-h-[90vh] flex flex-col"
+        className="bg-slate-800 rounded-lg shadow-2xl w-full max-w-xl max-h-[90vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-4 border-b border-slate-700">
-          <h2 className="text-xl font-bold">{title}</h2>
+          <h2 className="text-xl font-bold text-white">{title}</h2>
         </div>
         <div className="p-6 overflow-y-auto">{children}</div>
       </div>
@@ -833,9 +1235,10 @@ const AddDeviceModal: React.FC<{
   const [name, setName] = useState('');
   const [protocol, setProtocol] = useState<Protocol>(Protocol.HTTP);
   const [protocolConfig, setProtocolConfig] = useState<Record<string, string>>({});
+  const [imageUrl, setImageUrl] = useState('');
 
   const [sampleJson, setSampleJson] = useState(
-    '{\n  "device_id": "predio/torreA/sub1/reservatorio1",\n  "nivel_pct": 75,\n  "power_on": true,\n  "temperature": 22.5,\n  "gas_level": 300,\n  "wifi_rssi": -54\n}',
+    '{\n  "device_id": "predio/torreA/sub1/reservatorio1",\n  "nivel_pct": 75,\n  "power_on": true,\n  "temperature": 22.5,\n  "gas_level": 300,\n  "wifi_rssi": -54,\n  "update": 1717000000\n}',
   );
   const [parsedKeys, setParsedKeys] = useState<string[]>([]);
   const [jsonError, setJsonError] = useState('');
@@ -857,8 +1260,9 @@ const AddDeviceModal: React.FC<{
     setName('');
     setProtocol(Protocol.HTTP);
     setProtocolConfig({});
+    setImageUrl('');
     setSampleJson(
-      '{\n  "device_id": "predio/torreA/sub1/reservatorio1",\n  "nivel_pct": 75,\n  "power_on": true,\n  "temperature": 22.5,\n  "gas_level": 300,\n  "wifi_rssi": -54\n}',
+      '{\n  "device_id": "predio/torreA/sub1/reservatorio1",\n  "nivel_pct": 75,\n  "power_on": true,\n  "temperature": 22.5,\n  "gas_level": 300,\n  "wifi_rssi": -54,\n  "update": 1717000000\n}',
     );
     setWidgets([]);
   };
@@ -883,7 +1287,8 @@ const AddDeviceModal: React.FC<{
       protocolConfig,
       sampleJson,
       widgets: widgetsWithId as any,
-    });
+      imageUrl,
+    } as any);
 
     handleClose();
   };
@@ -984,6 +1389,7 @@ const AddDeviceModal: React.FC<{
         unit: '',
         minAcceptable: null,
         maxAcceptable: null,
+        engFormula: '',
       },
     ]);
   };
@@ -1012,7 +1418,6 @@ const AddDeviceModal: React.FC<{
         <p className="text-red-400">{t('modal.addDevice.limit')}</p>
       ) : (
         <div className="space-y-4">
-          {/* Stepper */}
           <div className="flex justify-between items-center mb-6">
             <div
               className={`text-center ${
@@ -1068,7 +1473,6 @@ const AddDeviceModal: React.FC<{
             </div>
           </div>
 
-          {/* Conteúdo dos passos */}
           {step === 1 && (
             <div className="space-y-4">
               <div>
@@ -1098,6 +1502,18 @@ const AddDeviceModal: React.FC<{
                     </option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-300">
+                  URL da imagem do dispositivo
+                </label>
+                <input
+                  type="text"
+                  value={imageUrl}
+                  onChange={(e) => setImageUrl(e.target.value)}
+                  placeholder="https://meuservidor.com/imagem.png"
+                  className="mt-1 block w-full bg-slate-700 border border-slate-600 rounded-md py-2 px-3"
+                />
               </div>
             </div>
           )}
@@ -1168,7 +1584,7 @@ const AddDeviceModal: React.FC<{
                             {Object.values(WidgetType).map((wt) => (
                               <option key={wt} value={wt}>
                                 {t(
-                                  `widget.${wt
+                                  `widget.${String(wt)
                                     .toLowerCase()
                                     .replace(' ', '')}`,
                                 )}
@@ -1213,10 +1629,9 @@ const AddDeviceModal: React.FC<{
                               handleWidgetChange(i, 'unit', e.target.value)
                             }
                             className="w-full bg-slate-600 border-slate-500 rounded text-sm p-1"
-                            placeholder="e.g. °C, %"
+                            placeholder="e.g. °C, %, m, L"
                           />
                         </div>
-                        {/* Threshold mínimo */}
                         <div>
                           <label className="text-xs">Valor mínimo aceitável</label>
                           <input
@@ -1234,7 +1649,6 @@ const AddDeviceModal: React.FC<{
                             className="w-full bg-slate-600 border-slate-500 rounded text-sm p-1"
                           />
                         </div>
-                        {/* Threshold máximo */}
                         <div>
                           <label className="text-xs">Valor máximo aceitável</label>
                           <input
@@ -1252,6 +1666,24 @@ const AddDeviceModal: React.FC<{
                             className="w-full bg-slate-600 border-slate-500 rounded text-sm p-1"
                           />
                         </div>
+                        <div className="col-span-2">
+                          <label className="text-xs">
+                            Fórmula de unidade de engenharia (use x)
+                          </label>
+                          <input
+                            type="text"
+                            value={w.engFormula ?? ''}
+                            onChange={(e) =>
+                              handleWidgetChange(i, 'engFormula', e.target.value)
+                            }
+                            className="w-full bg-slate-600 border-slate-500 rounded text-sm p-1"
+                            placeholder="Ex.: x * 0.25 + 10"
+                          />
+                          <p className="text-[10px] text-slate-300 mt-1">
+                            O valor bruto recebido entra como <strong>x</strong>. A
+                            saída da fórmula será usada nos gráficos, gauges e limites.
+                          </p>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1266,7 +1698,6 @@ const AddDeviceModal: React.FC<{
             </div>
           )}
 
-          {/* Navegação */}
           <div className="flex justify-between mt-6">
             <button
               onClick={() => setStep((s) => s - 1)}
@@ -1407,7 +1838,7 @@ const Sidebar: React.FC<{
                       e.preventDefault();
                       setSelectedCompany(company.id);
                     }}
-                    className={`flex-1 flex items-center gap-3 px-3 py-2 rounded-md transition-colors ${
+                    className={`flex-1 flex items	center gap-3 px-3 py-2 rounded-md transition-colors ${
                       selectedCompany === company.id
                         ? 'bg-sky-600 text-white'
                         : 'text-slate-300 hover:bg-slate-700'
