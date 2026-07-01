@@ -3,6 +3,7 @@ const express = require('express');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const fs = require('fs');
 const path = require('path');
+const mqtt = require('mqtt');
 
 const PORT = Number(process.env.PORT || process.env.API_PORT || 5175);
 const app = express();
@@ -110,6 +111,38 @@ app.get('/api/devices', (_req, res) => {
 const TELEMETRY_FILE = path.join(__dirname, 'telemetry.json');
 let lastTelemetry = {};
 
+// ======================================================
+// SSE - ENVIO EM TEMPO REAL PARA O FRONTEND
+// ======================================================
+const sseClients = new Set();
+
+function sendSseEvent(type, data) {
+  const payload = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+
+  for (const res of sseClients) {
+    try {
+      res.write(payload);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+
+  res.write(': connected\n\n');
+
+  sseClients.add(res);
+
+  req.on('close', () => {
+    sseClients.delete(res);
+  });
+});
+
 function loadTelemetry() {
   try {
     if (fs.existsSync(TELEMETRY_FILE)) {
@@ -129,6 +162,60 @@ function saveTelemetry() {
 }
 
 loadTelemetry();
+// ======================================================
+// MQTT - RECEBIMENTO DE TELEMETRIA
+// ======================================================
+
+const MQTT_URL = process.env.MQTT_URL || 'mqtt://127.0.0.1:1883';
+const MQTT_TOPIC = process.env.MQTT_TOPIC || 'devices/#';
+
+const mqttClient = mqtt.connect(MQTT_URL, {
+  reconnectPeriod: 5000,
+  connectTimeout: 10000
+});
+
+mqttClient.on('connect', () => {
+  console.log(`[mqtt] conectado em ${MQTT_URL}`);
+  mqttClient.subscribe(MQTT_TOPIC, (err) => {
+    if (err) {
+      console.error('[mqtt] erro ao assinar tópico', err.message);
+    } else {
+      console.log(`[mqtt] assinando ${MQTT_TOPIC}`);
+    }
+  });
+});
+
+mqttClient.on('message', (topic, message) => {
+  try {
+    const text = message.toString();
+    const body = JSON.parse(text);
+
+    const deviceId =
+      body.device_id ||
+      topic.replace(/^devices\//, '').replace(/\/telemetry$/, '');
+
+    if (!deviceId) return;
+
+    lastTelemetry[deviceId] = {
+      ...body,
+      device_id: deviceId,
+      mqtt_topic: topic,
+      received_at: Date.now()
+    };
+
+    saveTelemetry();
+
+    sendSseEvent('telemetry', lastTelemetry[deviceId]);
+
+    console.log(`[mqtt][telemetry] ${deviceId}`, lastTelemetry[deviceId]);
+  } catch (e) {
+    console.error('[mqtt] mensagem inválida', topic, message.toString());
+  }
+});
+
+mqttClient.on('error', (err) => {
+  console.error('[mqtt] erro', err.message);
+});
 
 // === POST /api/nivel  (dispositivos enviam dados) ===
 app.post('/api/nivel', (req, res) => {

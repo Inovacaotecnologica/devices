@@ -250,6 +250,62 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
     localStorage.setItem(devicesKey, JSON.stringify(devices));
   }, [devices, user]);
 
+    // ===========================================================
+  // TEMPO REAL: RECEBE TELEMETRIA MQTT VIA SSE DO BACKEND
+  // ===========================================================
+  useEffect(() => {
+    if (!user || typeof window === 'undefined') return;
+
+    const eventsUrl = 'http://127.0.0.1:5175/api/events';
+    const source = new EventSource(eventsUrl);
+
+    source.addEventListener('telemetry', (event) => {
+      try {
+        const data = JSON.parse((event as MessageEvent).data);
+        const deviceId = data.device_id;
+
+        if (!deviceId) return;
+
+        setDevices((currentDevices) =>
+          currentDevices.map((device) => {
+            const cfg = (device as any).protocolConfig || {};
+
+            const matchesByTopic =
+              device.protocol === Protocol.MQTT &&
+              cfg.topic &&
+              data.mqtt_topic === cfg.topic;
+
+            const matchesByDeviceId =
+              device.id === deviceId ||
+              device.name === deviceId ||
+              cfg.device_id === deviceId;
+
+            if (!matchesByTopic && !matchesByDeviceId) {
+              return device;
+            }
+
+            return {
+              ...device,
+              lastData: data,
+              lastUpdated: data.received_at || Date.now(),
+              isOnline: true,
+            };
+          }),
+        );
+      } catch (error) {
+        console.error('[SSE] Erro ao processar telemetria', error);
+      }
+    });
+
+    source.onerror = (error) => {
+      console.error('[SSE] Falha na conexão com /api/events', error);
+    };
+
+    return () => {
+      source.close();
+    };
+  }, [user]);
+
   // ===========================================================
   // POLLING: MONITORAMENTO ONLINE/OFFLINE BASEADO EM UPDATE
   // ===========================================================

@@ -1,6 +1,5 @@
 {
   "homepage": "https://devices.net.br/",
-
   "name": "devices-cloud",
   "private": true,
   "version": "0.0.0",
@@ -11,6 +10,7 @@
     "express": "^4.21.1",
     "ftp-srv": "^4.6.3",
     "http-proxy-middleware": "^3.0.3",
+    "mqtt": "^5.14.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "uuid": "^13.0.0"

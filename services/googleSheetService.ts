@@ -7,7 +7,7 @@ const GOOGLE_SHEET_URL =
 // Proxy para contornar CORS no navegador
 const PROXY_URL = `https://api.allorigins.win/raw?url=${encodeURIComponent(GOOGLE_SHEET_URL)}`;
 
-export const fetchUsers = async (): Promise<(User & { senha: string })[]> => {
+export const fetchUsers = async (): Promise<(User & { senha: string; isActive: boolean })[]> => {
   const response = await fetch(PROXY_URL);
   if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
@@ -33,26 +33,42 @@ export const fetchUsers = async (): Promise<(User & { senha: string })[]> => {
   if (!lines.length || !lines[0].trim()) return [];
 
   const headers = lines[0].split(',').map(h => h.trim());
-  const emailIndex = headers.indexOf('email');
-  const passwordIndex = headers.indexOf('senha');
-  const maxCompaniesIndex = headers.indexOf('maxCompanies');
-  const maxDevicesIndex = headers.indexOf('maxDevices');
+
+  const emailIndex         = headers.indexOf('email');
+  const passwordIndex      = headers.indexOf('senha');
+  const statusIndex        = headers.indexOf('status');        // <- usa a coluna status
+  const maxCompaniesIndex  = headers.indexOf('maxCompanies');
+  const maxDevicesIndex    = headers.indexOf('maxDevices');
 
   if ([emailIndex, passwordIndex, maxCompaniesIndex, maxDevicesIndex].includes(-1)) {
     throw new Error('Malformed CSV headers.');
   }
 
-  const users = lines.slice(1).map(line => {
-    if (!line.trim()) return null;
-    const values = line.split(',').map(v => v.trim());
-    if (values.length < headers.length) return null;
-    return {
-      email: values[emailIndex],
-      senha: values[passwordIndex],
-      maxCompanies: parseInt(values[maxCompaniesIndex], 10) || 0,
-      maxDevices: parseInt(values[maxDevicesIndex], 10) || 0
-    };
-  }).filter(Boolean) as (User & { senha: string })[];
+  const users = lines
+    .slice(1)
+    .map(line => {
+      if (!line.trim()) return null;
+
+      const values = line.split(',').map(v => v.trim());
+      if (values.length < headers.length) return null;
+
+      // se não achar a coluna "status", considera ativo
+      let isActive = true;
+      if (statusIndex !== -1) {
+        const raw = (values[statusIndex] || '').toLowerCase();
+        // na sua planilha: "ativo" / "inativo"
+        isActive = raw === 'ativo';
+      }
+
+      return {
+        email: values[emailIndex],
+        senha: values[passwordIndex],
+        maxCompanies: parseInt(values[maxCompaniesIndex], 10) || 0,
+        maxDevices: parseInt(values[maxDevicesIndex], 10) || 0,
+        isActive,
+      };
+    })
+    .filter(Boolean) as (User & { senha: string; isActive: boolean })[];
 
   return users;
 };
