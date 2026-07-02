@@ -166,12 +166,15 @@ loadTelemetry();
 // MQTT - RECEBIMENTO DE TELEMETRIA
 // ======================================================
 
-const MQTT_URL = process.env.MQTT_URL || 'mqtt://127.0.0.1:1883';
+const MQTT_URL = process.env.MQTT_URL || 'mqtts://61a2835a1bf84052b9c2b861a7e33fc9.s1.eu.hivemq.cloud:8883';
 const MQTT_TOPIC = process.env.MQTT_TOPIC || 'devices/#';
 
 const mqttClient = mqtt.connect(MQTT_URL, {
+  username: process.env.MQTT_USER || 'devices',
+  password: process.env.MQTT_PASS || '',
+  protocolVersion: 5,
   reconnectPeriod: 5000,
-  connectTimeout: 10000
+  connectTimeout: 10000,
 });
 
 mqttClient.on('connect', () => {
