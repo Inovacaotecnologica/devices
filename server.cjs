@@ -190,6 +190,9 @@ mqttClient.on('connect', () => {
 
 mqttClient.on('message', (topic, message) => {
   try {
+    if (!topic.endsWith('/telemetry')) {
+  return;
+}
     const text = message.toString();
     const body = JSON.parse(text);
 
@@ -241,14 +244,84 @@ app.post('/api/nivel', (req, res) => {
   return res.json({ ok: true });
 });
 
-// === GET /api/nivel/:deviceId (dashboard lê último dado) ===
+// === GET /api/nivel/:deviceId (dashboard lê último dado + status online/offline) ===
 app.get('/api/nivel/:deviceId', (req, res) => {
   const deviceId = req.params.deviceId;
   const data = lastTelemetry[deviceId];
-  if (!data) return res.status(404).json({ ok: false, error: 'not found' });
-  return res.json(data);
+
+  if (!data) {
+    return res.status(404).json({
+      ok: false,
+      error: 'not found',
+      device_id: deviceId,
+      is_online: false,
+      status: 'offline',
+      age_ms: null,
+      offline_after_ms: 120000
+    });
+  }
+
+  const now = Date.now();
+  const receivedAt = Number(data.received_at || 0);
+  const ageMs = receivedAt > 0 ? now - receivedAt : null;
+
+  const OFFLINE_AFTER_MS = 2 * 60 * 1000; // 2 minutos
+  const isOnline = ageMs !== null && ageMs <= OFFLINE_AFTER_MS;
+
+  return res.json({
+    ...data,
+    ok: true,
+    is_online: isOnline,
+    status: isOnline ? 'online' : 'offline',
+    age_ms: ageMs,
+    offline_after_ms: OFFLINE_AFTER_MS,
+    last_seen_at: receivedAt
+  });
 });
 
+// ======================================================
+// COMANDO DE RELÉS VIA MQTT
+// Dashboard -> API -> HiveMQ -> ESP32
+// ======================================================
+app.post('/api/relay', (req, res) => {
+  const { device_id, relay, state } = req.body || {};
+
+  if (!device_id) {
+    return res.status(400).json({ ok: false, error: 'missing device_id' });
+  }
+
+  if (![1, 2, 3].includes(Number(relay))) {
+    return res.status(400).json({ ok: false, error: 'invalid relay' });
+  }
+
+  if (typeof state !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'state must be boolean' });
+  }
+
+  const cmdTopic = `devices/${device_id}/cmd`;
+
+  const payload = {
+    device_id,
+    relay: Number(relay),
+    state,
+    sent_at: Date.now()
+  };
+
+  mqttClient.publish(cmdTopic, JSON.stringify(payload), { qos: 0 }, (err) => {
+    if (err) {
+      console.error('[relay] erro ao publicar comando', err.message);
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+
+    console.log(`[relay][cmd] ${cmdTopic}`, payload);
+
+    return res.json({
+      ok: true,
+      topic: cmdTopic,
+      payload
+    });
+  });
+});
 // ======================================================
 // Proxy para dispositivos reais
 // ======================================================
