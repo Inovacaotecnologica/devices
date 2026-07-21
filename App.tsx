@@ -111,6 +111,71 @@ const extractDeviceTimestamp = (payload: any): number | null => {
 };
 
 // =================================================================================
+// FUNÇÕES AUXILIARES – API BACKEND / MQTT
+// =================================================================================
+
+const getApiBaseUrl = (): string => {
+  if (typeof window === 'undefined') return 'http://127.0.0.1:5175';
+
+  const host = window.location.hostname;
+
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return 'http://127.0.0.1:5175';
+  }
+
+  return 'https://api.devices.net.br';
+};
+
+const API_BASE_URL = getApiBaseUrl();
+
+const extractDeviceIdFromTopic = (topic?: string): string | null => {
+  if (!topic) return null;
+
+  const prefix = 'devices/';
+  const suffix = '/telemetry';
+
+  if (topic.startsWith(prefix) && topic.endsWith(suffix)) {
+    return topic.slice(prefix.length, -suffix.length);
+  }
+
+  return null;
+};
+
+const getDeviceBackendId = (device: Device): string => {
+  const cfg = (device as any).protocolConfig || {};
+  const lastData = (device.lastData || {}) as any;
+
+  return (
+    cfg.device_id ||
+    lastData.device_id ||
+    extractDeviceIdFromTopic(cfg.topic) ||
+    device.name
+  );
+};
+
+const getDeviceDataUrl = (device: Device): string => {
+  const deviceId = getDeviceBackendId(device);
+  return `${API_BASE_URL}/api/nivel/${encodeURIComponent(deviceId)}`;
+};
+
+const normalizeDeviceFromApi = (device: Device, newData: any): Device => {
+  const now = Date.now();
+  const lastUpdated = Number(newData.last_seen_at || newData.received_at || now);
+
+  const isOnline =
+    typeof newData.is_online === 'boolean'
+      ? newData.is_online
+      : now - lastUpdated <= OFFLINE_THRESHOLD;
+
+  return {
+    ...device,
+    lastData: newData,
+    lastUpdated,
+    isOnline,
+  };
+};
+
+// =================================================================================
 // PROVIDERS
 // =================================================================================
 
@@ -318,6 +383,39 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
           if (currentDevices.length === 0) return;
 
           const devicePromises = currentDevices.map(async (d): Promise<Device> => {
+            if (d.protocol === Protocol.MQTT) {
+              try {
+                const response = await fetch(getDeviceDataUrl(d), { cache: 'no-store' });
+
+                if (!response.ok) {
+                  console.error(`[Device: ${d.name}] MQTT/API error: ${response.status}`);
+                  return {
+                    ...d,
+                    isOnline: false,
+                  };
+                }
+
+                const newData = await response.json();
+
+                if (
+                  typeof newData === 'object' &&
+                  newData !== null &&
+                  !Array.isArray(newData)
+                ) {
+                  return normalizeDeviceFromApi(d, newData);
+                }
+
+                console.error(`[Device: ${d.name}] Invalid MQTT/API JSON:`, newData);
+                return d;
+              } catch (error) {
+                console.error(`[Device: ${d.name}] Failed to fetch MQTT API data:`, error);
+                return {
+                  ...d,
+                  isOnline: false,
+                };
+              }
+            }
+
             if (d.protocol === Protocol.HTTP && (d as any).protocolConfig?.url) {
               try {
                 const url = (d as any).protocolConfig.url;
@@ -578,25 +676,95 @@ const SwitchWidget: React.FC<WidgetProps> = ({ device, widget }) => {
   const rawValue = (device.lastData as any)[widget.dataKey] ?? false;
   const isOn = Boolean(rawValue);
   const { isOutOfRange } = useThresholdAlert(device, widget, rawValue);
+  const [pending, setPending] = useState(false);
+
+  const relayMatch = String(widget.dataKey).match(/^relay([1-3])$/);
+  const relayNumber = relayMatch ? Number(relayMatch[1]) : null;
+  const isRelayCommand = device.protocol === Protocol.MQTT && relayNumber !== null;
+
+  const sendRelayCommand = async () => {
+    if (!isRelayCommand || !relayNumber) return;
+
+    const deviceId = getDeviceBackendId(device);
+    const nextState = !isOn;
+
+    setPending(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/relay`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          device_id: deviceId,
+          relay: relayNumber,
+          state: nextState,
+        }),
+      });
+
+      const body = await response.json().catch(() => null);
+
+      if (!response.ok || body?.ok === false) {
+        throw new Error(body?.error || `Erro HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.error(`[Relay] Falha ao comandar ${widget.dataKey}`, error);
+      alert(`Falha ao comandar ${widget.name}. Verifique se o server.cjs está rodando.`);
+    } finally {
+      setPending(false);
+    }
+  };
 
   return (
     <div className="flex flex-col items-center justify-center h-full p-4 gap-4">
-      <div
-        className={`w-24 h-12 rounded-full flex items-center p-1 cursor-default transition-colors duration-300 ${
-          isOn ? 'bg-green-500 justify-end' : 'bg-slate-600 justify-start'
-        } ${isOutOfRange ? 'ring-2 ring-red-500 ring-offset-2 ring-offset-slate-900' : ''}`}
+      <button
+        type="button"
+        disabled={!isRelayCommand || pending}
+        onClick={sendRelayCommand}
+        className={`relative w-28 h-14 rounded-full flex items-center p-1 transition-all duration-300 ${
+          isOn ? 'bg-green-500' : 'bg-slate-600'
+        } ${
+          isRelayCommand
+            ? 'cursor-pointer hover:brightness-110'
+            : 'cursor-default'
+        } ${
+          isOutOfRange ? 'ring-2 ring-red-500 ring-offset-2 ring-offset-slate-900' : ''
+        } disabled:opacity-70`}
       >
-        <div className="w-10 h-10 bg-white rounded-full shadow-lg" />
+        <div
+          className={`w-12 h-12 bg-white rounded-full shadow-lg transition-transform duration-300 ${
+            isOn ? 'translate-x-14' : 'translate-x-0'
+          }`}
+        />
+      </button>
+
+      <div className="text-center">
+        <div
+          className={`text-2xl font-bold ${
+            isOn ? 'text-green-400' : 'text-slate-400'
+          }`}
+        >
+          {pending ? '...' : isOn ? 'LIGADO' : 'DESLIGADO'}
+        </div>
+
+        {isRelayCommand && (
+          <div className="text-[11px] text-slate-500 mt-1">
+            Clique para {isOn ? 'desligar' : 'ligar'}
+          </div>
+        )}
+
+        {!isRelayCommand && (
+          <div className="text-[11px] text-slate-500 mt-1">
+            Status somente leitura
+          </div>
+        )}
       </div>
-      <div
-        className={`text-2xl font-bold ${
-          isOn ? 'text-green-400' : 'text-slate-400'
-        }`}
-      >
-        {isOn ? 'ON' : 'OFF'}
-      </div>
+
       {isOutOfRange && (
-        <span className="text-xs text-red-400 font-semibold">Alerta de faixa</span>
+        <span className="text-xs text-red-400 font-semibold">
+          Alerta de faixa
+        </span>
       )}
     </div>
   );
@@ -1023,6 +1191,7 @@ const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
 // =================================================================================
 // DEVICE CARD
 // =================================================================================
+
 
 const DeviceCard: React.FC<{ device: Device }> = ({ device }) => {
   const { t } = useI18n();

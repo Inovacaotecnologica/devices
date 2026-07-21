@@ -1,6 +1,6 @@
 /*
   Devices IoT Platform - Firmware ESP32
-  Versão: v1.1.2
+  Versão: v1.1.3
 
   Sensores:
   - Nível por ultrassônico
@@ -11,13 +11,16 @@
   - Reserva 1
   - Reserva 2
 
-  Removido:
-  - Sensor de gás
+  Comandos:
+  - Recebe comandos MQTT em:
+    devices/{device_id}/cmd
 
-  Status:
-  - LED piscando = aguardando conexão Wi-Fi ou MQTT
-  - LED aceso fixo = Wi-Fi + MQTT conectados
-  - Portal Devices-Setup não fecha enquanto não conectar
+  Exemplo de comando:
+  {
+    "device_id": "predio/torreA/sub1/reservatorio2",
+    "relay": 1,
+    "state": true
+  }
 */
 
 #include <WiFi.h>
@@ -28,7 +31,7 @@
 #include <Ticker.h>
 #include <DHT.h>
 
-#define FW_VERSION "1.1.2"
+#define FW_VERSION "1.1.3"
 
 // =========================
 // PINOS
@@ -51,6 +54,10 @@
 #define PIN_RELAY2 26
 #define PIN_RELAY3 27
 
+// Módulo de relé ativo em LOW
+#define RELAY_ON_LEVEL LOW
+#define RELAY_OFF_LEVEL HIGH
+
 // Reservas analógicas
 #define PIN_RESERVA1 32
 #define PIN_RESERVA2 33
@@ -60,12 +67,12 @@
 // =========================
 Preferences prefs;
 
-char deviceId[80] = "predio/torreA/sub1/reservatorio1";
+char deviceId[80] = "predio/torreA/sub1/reservatorio2";
 char mqttHost[120] = "61a2835a1bf84052b9c2b861a7e33fc9.s1.eu.hivemq.cloud";
 char mqttPortStr[8] = "8883";
 char mqttUser[40] = "devices";
 char mqttPass[80] = "";
-char mqttTopic[150] = "devices/predio/torreA/sub1/reservatorio1/telemetry";
+char mqttTopic[150] = "devices/predio/torreA/sub1/reservatorio2/telemetry";
 char intervalStr[10] = "15000";
 
 char tankHeightStr[10] = "1700";
@@ -85,6 +92,8 @@ Ticker ledTicker;
 DHT dht(PIN_DHT, DHTTYPE);
 
 unsigned long lastSend = 0;
+
+void sendTelemetry();
 
 // =========================
 // LED STATUS
@@ -114,6 +123,21 @@ void ledOff() {
 void safeCopy(char *dest, const char *src, size_t size) {
   strncpy(dest, src, size - 1);
   dest[size - 1] = '\0';
+}
+
+// =========================
+// TOPIC DE COMANDO
+// =========================
+String getCommandTopic() {
+  String topic = String(mqttTopic);
+
+  if (topic.endsWith("/telemetry")) {
+    topic.remove(topic.length() - String("/telemetry").length());
+    topic += "/cmd";
+    return topic;
+  }
+
+  return "devices/" + String(deviceId) + "/cmd";
 }
 
 // =========================
@@ -214,11 +238,7 @@ void setupWiFiManager() {
   WiFiManager wm;
 
   wm.setSaveConfigCallback(saveConfigCallback);
-
-  // Portal nunca fecha sozinho
   wm.setConfigPortalTimeout(0);
-
-  // Tempo para tentar conectar no Wi-Fi informado
   wm.setConnectTimeout(20);
 
   WiFiManagerParameter p_device("device", "Device ID", deviceId, 80);
@@ -292,29 +312,112 @@ void setupWiFiManager() {
 }
 
 // =========================
-// MQTT
+// RELÉS
 // =========================
-void reconnectMQTT() {
-  while (!mqttClient.connected()) {
-    startLedBlink();
+void setRelayState(int relay, bool state) {
+  int pin = -1;
 
-    String clientId = "devices-esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (relay == 1) pin = PIN_RELAY1;
+  if (relay == 2) pin = PIN_RELAY2;
+  if (relay == 3) pin = PIN_RELAY3;
 
-    Serial.print("Conectando MQTT em: ");
-    Serial.println(mqttHost);
-
-    bool connected = mqttClient.connect(clientId.c_str(), mqttUser, mqttPass);
-
-    if (connected) {
-      Serial.println("MQTT conectado.");
-      ledConnected();
-    } else {
-      Serial.print("Falha MQTT. Estado: ");
-      Serial.println(mqttClient.state());
-      Serial.println("Tentando novamente em 5 segundos...");
-      delay(5000);
-    }
+  if (pin == -1) {
+    Serial.println("Relé inválido.");
+    return;
   }
+
+  int outputLevel = state ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL;
+
+  digitalWrite(pin, outputLevel);
+  delay(100);
+
+  Serial.print("Relé ");
+  Serial.print(relay);
+  Serial.print(" comando: ");
+  Serial.println(state ? "LIGAR" : "DESLIGAR");
+
+  Serial.print("GPIO usado: ");
+  Serial.println(pin);
+
+  Serial.print("Nivel enviado ao GPIO: ");
+  Serial.println(outputLevel == HIGH ? "HIGH" : "LOW");
+
+  Serial.print("Nivel lido no GPIO apos comando: ");
+  Serial.println(digitalRead(pin) == HIGH ? "HIGH" : "LOW");
+}
+
+bool getRelayLogicalState(int pin) {
+  return digitalRead(pin) == RELAY_ON_LEVEL;
+}
+
+// =========================
+// PARSER SIMPLES JSON COMANDO
+// =========================
+bool extractRelayNumber(String msg, int &relay) {
+  int idx = msg.indexOf("\"relay\"");
+  if (idx < 0) idx = msg.indexOf("relay");
+  if (idx < 0) return false;
+
+  int colon = msg.indexOf(':', idx);
+  if (colon < 0) return false;
+
+  int start = colon + 1;
+
+  while (start < msg.length() && !isDigit(msg[start]) && msg[start] != '-') {
+    start++;
+  }
+
+  int end = start;
+
+  while (end < msg.length() && (isDigit(msg[end]) || msg[end] == '-')) {
+    end++;
+  }
+
+  if (start >= msg.length() || end <= start) return false;
+
+  relay = msg.substring(start, end).toInt();
+  return true;
+}
+
+bool extractStateValue(String msg, bool &state) {
+  int idx = msg.indexOf("\"state\"");
+  if (idx < 0) idx = msg.indexOf("state");
+  if (idx < 0) return false;
+
+  int colon = msg.indexOf(':', idx);
+  if (colon < 0) return false;
+
+  String value = msg.substring(colon + 1);
+  value.trim();
+  value.toLowerCase();
+
+  if (
+    value.startsWith("true") ||
+    value.startsWith("1") ||
+    value.startsWith("\"true\"") ||
+    value.startsWith("\"1\"") ||
+    value.startsWith("\"on\"") ||
+    value.startsWith("\"ligar\"") ||
+    value.startsWith("\"liga\"")
+  ) {
+    state = true;
+    return true;
+  }
+
+  if (
+    value.startsWith("false") ||
+    value.startsWith("0") ||
+    value.startsWith("\"false\"") ||
+    value.startsWith("\"0\"") ||
+    value.startsWith("\"off\"") ||
+    value.startsWith("\"desligar\"") ||
+    value.startsWith("\"desliga\"")
+  ) {
+    state = false;
+    return true;
+  }
+
+  return false;
 }
 
 // =========================
@@ -411,7 +514,7 @@ int readReserva2() {
 }
 
 // =========================
-// ENVIO MQTT
+// ENVIO MQTT TELEMETRIA
 // =========================
 void sendTelemetry() {
   bool enableUltra = String(enableUltrasonicStr) == "1";
@@ -427,9 +530,9 @@ void sendTelemetry() {
   float tempC = enableDht ? readTemperatureC() : -1;
   float umidPct = enableDht ? readHumidity() : -1;
 
-  bool relay1 = enableRelays ? digitalRead(PIN_RELAY1) : false;
-  bool relay2 = enableRelays ? digitalRead(PIN_RELAY2) : false;
-  bool relay3 = enableRelays ? digitalRead(PIN_RELAY3) : false;
+  bool relay1 = enableRelays ? getRelayLogicalState(PIN_RELAY1) : false;
+  bool relay2 = enableRelays ? getRelayLogicalState(PIN_RELAY2) : false;
+  bool relay3 = enableRelays ? getRelayLogicalState(PIN_RELAY3) : false;
 
   int reserva1 = enableReserva1 ? readReserva1() : -1;
   int reserva2 = enableReserva2 ? readReserva2() : -1;
@@ -461,6 +564,96 @@ void sendTelemetry() {
 }
 
 // =========================
+// PROCESSAR COMANDO MQTT
+// =========================
+void processCommand(String topic, String msg) {
+  String expectedTopic = getCommandTopic();
+
+  if (topic != expectedTopic) {
+    Serial.print("Comando ignorado. Topic recebido: ");
+    Serial.println(topic);
+    return;
+  }
+
+  Serial.println("Comando recebido:");
+  Serial.println(msg);
+
+  int relay = 0;
+  bool state = false;
+
+  if (!extractRelayNumber(msg, relay)) {
+    Serial.println("Comando inválido: relay ausente.");
+    return;
+  }
+
+  if (!extractStateValue(msg, state)) {
+    Serial.println("Comando inválido: state ausente.");
+    return;
+  }
+
+  if (relay < 1 || relay > 3) {
+    Serial.println("Comando inválido: relay deve ser 1, 2 ou 3.");
+    return;
+  }
+
+  setRelayState(relay, state);
+
+  delay(200);
+
+  sendTelemetry();
+}
+
+// =========================
+// CALLBACK MQTT
+// =========================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  processCommand(String(topic), msg);
+}
+
+// =========================
+// MQTT
+// =========================
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    startLedBlink();
+
+    uint64_t chipId = ESP.getEfuseMac();
+    String clientId = "devices-esp32-" + String((uint32_t)(chipId >> 32), HEX) + String((uint32_t)chipId, HEX);
+
+    Serial.print("Conectando MQTT em: ");
+    Serial.println(mqttHost);
+
+    bool connected = mqttClient.connect(clientId.c_str(), mqttUser, mqttPass);
+
+    if (connected) {
+      Serial.println("MQTT conectado.");
+
+      String cmdTopic = getCommandTopic();
+
+      if (mqttClient.subscribe(cmdTopic.c_str())) {
+        Serial.print("Assinando comandos em: ");
+        Serial.println(cmdTopic);
+      } else {
+        Serial.println("Falha ao assinar topic de comando.");
+      }
+
+      ledConnected();
+    } else {
+      Serial.print("Falha MQTT. Estado: ");
+      Serial.println(mqttClient.state());
+      Serial.println("Tentando novamente em 5 segundos...");
+      delay(5000);
+    }
+  }
+}
+
+// =========================
 // SETUP
 // =========================
 void setup() {
@@ -480,9 +673,9 @@ void setup() {
   pinMode(PIN_RELAY2, OUTPUT);
   pinMode(PIN_RELAY3, OUTPUT);
 
-  digitalWrite(PIN_RELAY1, LOW);
-  digitalWrite(PIN_RELAY2, LOW);
-  digitalWrite(PIN_RELAY3, LOW);
+  digitalWrite(PIN_RELAY1, RELAY_OFF_LEVEL);
+  digitalWrite(PIN_RELAY2, RELAY_OFF_LEVEL);
+  digitalWrite(PIN_RELAY3, RELAY_OFF_LEVEL);
 
   dht.begin();
 
@@ -502,16 +695,21 @@ void setup() {
   secureClient.setInsecure();
 
   int mqttPort = atoi(mqttPortStr);
+
   mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(1024);
+  mqttClient.setKeepAlive(30);
 
   reconnectMQTT();
 
   Serial.println("Sistema iniciado com sucesso.");
   Serial.print("Device ID: ");
   Serial.println(deviceId);
-  Serial.print("Topic: ");
+  Serial.print("Telemetry Topic: ");
   Serial.println(mqttTopic);
+  Serial.print("Command Topic: ");
+  Serial.println(getCommandTopic());
 }
 
 // =========================
