@@ -1,4 +1,4 @@
-import React, {
+﻿import React, {
   useState,
   useEffect,
   useCallback,
@@ -321,7 +321,7 @@ const DataProvider = ({ children }: { children: ReactNode }) => {
   useEffect(() => {
     if (!user || typeof window === 'undefined') return;
 
-    const eventsUrl = 'http://127.0.0.1:5175/api/events';
+    const eventsUrl = `${API_BASE_URL}/api/events`;
     const source = new EventSource(eventsUrl);
 
     source.addEventListener('telemetry', (event) => {
